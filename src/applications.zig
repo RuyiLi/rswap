@@ -1,159 +1,117 @@
+//! Logic for window cycling + force focusing.
+
 const std = @import("std");
 const win = std.os.windows;
+const win32 = @import("win32.zig");
+const appmodel = @import("appmodel.zig");
 
-const WNDENUMPROC = *const fn (hwnd: win.HWND, lParam: win.LPARAM) callconv(.winapi) bool;
+const log = std.log.scoped(.rswap);
 
-extern "user32" fn EnumWindows(lpEnumFunc: WNDENUMPROC, lParam: win.LPARAM) callconv(.winapi) bool;
-extern "user32" fn IsWindowVisible(hwnd: win.HWND) callconv(.winapi) bool;
-extern "user32" fn GetWindowTextW(hwnd: win.HWND, lpString: win.LPWSTR, nMaxCount: c_int) callconv(.winapi) c_int;
-extern "dwmapi" fn DwmGetWindowAttribute(hwnd: win.HWND, dwAttribute: win.DWORD, pvAttribute: win.PVOID, cbAttribute: win.DWORD) callconv(.winapi) win.HRESULT;
-extern "user32" fn GetWindowThreadProcessId(hwnd: win.HWND, lpdwProcessId: *win.DWORD) callconv(.winapi) win.DWORD;
-extern "kernel32" fn OpenProcess(dwDesiredAccess: win.DWORD, bInheritHandle: bool, dwProcessId: win.DWORD) callconv(.winapi) ?win.HANDLE;
-extern "user32" fn QueryFullProcessImageNameW(hProcess: win.HANDLE, dwFlags: win.DWORD, lpExeName: win.LPWSTR, lpDwSize: *win.DWORD) callconv(.winapi) win.BOOL;
-extern "user32" fn GetFileVersionInfoSizeW(lpstrFilename: *const win.WCHAR, lpdwHandle: ?*win.DWORD) callconv(.winapi) win.DWORD;
-extern "user32" fn GetFileVersionInfoW(lptstrFilename: *const win.WCHAR, dwHandle: win.DWORD, dwLen: win.DWORD, lpData: win.PVOID) callconv(.winapi) bool;
-extern "user32" fn VerQueryValueA(pBlock: *win.LPCVOID, lpSubBlock: win.LPCSTR, lplpBuffer: *win.LPVOID, puLen: *win.UINT) callconv(.winapi) bool;
-extern "user32" fn ShowWindow(hwnd: win.HWND, nCmdShow: c_int) callconv(.winapi) win.BOOL;
-extern "user32" fn SetForegroundWindow(hwnd: win.HWND) callconv(.winapi) win.BOOL;
+var cycle_windows: [64]win.HWND = undefined;
+var cycle_len: usize = 0;
+var cycle_index: usize = 0;
+var cycle_active = false;
+var cycle_target: ?appmodel.AppTarget = null;
 
-const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
-const DWMWA_CLOAKED: win.DWORD = 14;
+const ScanCtx = struct {
+    allocator: std.mem.Allocator,
+    target: appmodel.AppTarget,
+    windows: []win.HWND,
+    len: usize = 0,
+};
 
-const CollectActiveWindowsParams = struct { names: std.ArrayList([]u16), allocator: std.mem.Allocator };
-
-// assume error => cloaked
 fn is_cloaked(hwnd: win.HWND) bool {
     var attr_val: win.DWORD = 0;
-    const hresult = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &attr_val, @sizeOf(win.DWORD));
-    if (hresult != 0) {
-        return true;
-    }
+    const hresult = win32.DwmGetWindowAttribute(hwnd, win32.DWMWA_CLOAKED, &attr_val, @sizeOf(win.DWORD));
+    if (hresult != 0) return true;
     return attr_val != 0;
 }
 
-fn collect_active_windows(hwnd: win.HWND, l_param: win.LPARAM) callconv(.winapi) bool {
-    const params_ptr: usize = @intCast(l_param);
-    const params: *CollectActiveWindowsParams = @ptrFromInt(params_ptr);
-    var names: std.ArrayList([]u16) = params.names;
-    const allocator: std.mem.Allocator = params.allocator;
-
-    if (IsWindowVisible(hwnd) and !is_cloaked(hwnd)) {
-        var pid: u32 = 0;
-        _ = GetWindowThreadProcessId(hwnd, &pid);
-
-        const h_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) orelse return true;
-        defer _ = win.CloseHandle(h_process);
-
-        var buf: [1024:0]u16 = undefined;
-        var len: u32 = 1024;
-
-        if (QueryFullProcessImageNameW(h_process, 0, &buf, &len) == 0) {
-            const err = win.GetLastError();
-            std.debug.print("Failed to get window name: {}\n", .{err});
-            return true;
-        }
-
-        // Short window name test
-        // const filename = buf[0..len];
-        // const bytes = GetFileVersionInfoSizeW(&filename, null);
-
-        // var data = allocator.alloc(u8, bytes) catch return true;
-        // errdefer allocator.free(data);
-
-        // if (GetFileVersionInfoW(filename, 0, version_size, out.ptr) == 0) {
-        //     const err = win.GetLastError();
-        //     std.debug.print("Failed to get version info: {}\n", .{err});
-        //     return true;
-        // }
-
-        // var trans_ptr: ?*anyopaque = null;
-        // var trans_len: u32 = 0;
-        // if (VerQueryValueA(out.ptr, "\\VarFileInfo\\Translation", &trans_ptr, &trans_len) == 0) {}
-
-        const name = allocator.alloc(u16, len) catch return true;
-        @memcpy(name, buf[0..len]);
-        const s = std.unicode.utf16LeToUtf8AllocZ(allocator, name) catch "idk";
-        std.debug.print("Found: {s}\n", .{s});
-
-        names.append(allocator, name) catch return true;
-
-        // Window switching test
-        // if (std.mem.count(u8, s, "edge") > 0) {
-        //     std.Thread.sleep(2000000000);
-        //     _ = ShowWindow(hwnd, 5);
-        //     _ = SetForegroundWindow(hwnd);
-        //     return false;
-        // }
-
-        // var buf: [1024:0]u16 = undefined;
-        // const len = GetWindowTextW(hwnd, &buf, 1024);
-        // if (len == 0) {
-        //     const err = win.GetLastError();
-        //     std.debug.print("Failed to get window name: {}\n", .{err});
-        //     return true;
-        // }
-
-        // std.debug.print("Found app with len: {}\n", .{len});
-        // const ulen: usize = @intCast(len);
-        // const name = allocator.alloc(u16, ulen) catch return true;
-        // @memcpy(name, buf[0..ulen]);
-
-        // const utf8string = std.unicode.utf16LeToUtf8Alloc(allocator, name) catch "";
-        // std.debug.print("as: {s}\n", .{utf8string});
-
-        // names.append(allocator, name) catch return true;
-    }
-
+fn scan_callback(hwnd: win.HWND, l_param: win.LPARAM) callconv(.winapi) bool {
+    const ctx: *ScanCtx = @ptrFromInt(@as(usize, @intCast(l_param)));
+    if (ctx.len >= ctx.windows.len) return false;
+    if (!win32.IsWindowVisible(hwnd)) return true;
+    if (is_cloaked(hwnd)) return true;
+    if (!appmodel.window_matches(ctx.allocator, hwnd, ctx.target)) return true;
+    ctx.windows[ctx.len] = hwnd;
+    ctx.len += 1;
     return true;
 }
 
-pub fn list_applications(allocator: std.mem.Allocator) !std.ArrayList([]u16) {
-    const names = try std.ArrayList([]u16).initCapacity(allocator, 1024);
-    const params = CollectActiveWindowsParams{
-        .names = names,
-        .allocator = allocator,
+// Create snapshot of windows matching target app.
+fn start_scan() void {
+    const target = cycle_target orelse return;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var ctx = ScanCtx{
+        .allocator = arena.allocator(),
+        .target = target,
+        .windows = cycle_windows[0..],
     };
+    const lp: win.LPARAM = @intCast(@intFromPtr(&ctx));
+    _ = win32.EnumWindows(&scan_callback, lp);
 
-    const lp: win.LPARAM = @intCast(@intFromPtr(&params));
-    _ = EnumWindows(&collect_active_windows, lp);
-    return names;
+    cycle_len = ctx.len;
+    cycle_index = 0;
+    cycle_active = true;
 }
 
-fn find_and_activate_window(hwnd: win.HWND, l_param: win.LPARAM) callconv(.winapi) bool {
-    const name_ptr: usize = @intCast(l_param);
-    const name: *[]u16 = @ptrFromInt(name_ptr);
-    _ = name;
-
-    if (IsWindowVisible(hwnd) and !is_cloaked(hwnd)) {
-        var pid: u32 = 0;
-        _ = GetWindowThreadProcessId(hwnd, &pid);
-
-        const h_process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) orelse return true;
-        defer _ = win.CloseHandle(h_process);
-
-        var buf: [1024:0]u16 = undefined;
-        var len: u32 = 1024;
-
-        if (QueryFullProcessImageNameW(h_process, 0, &buf, &len) == 0) {
-            const err = win.GetLastError();
-            std.debug.print("Failed to get window name: {}\n", .{err});
-            return true;
-        }
-
-        const edge: []const u16 = &[_]u16{ 'e', 'd', 'g', 'e' };
-        const res = std.mem.count(u16, buf[0..len], edge);
-        // std.debug.print("FN {}\n", .{res});
-        if (res > 0) {
-            // std.Thread.sleep(2000000000);
-            _ = ShowWindow(hwnd, 5);
-            _ = SetForegroundWindow(hwnd);
-            return false;
-        }
+/// TODO opening a new window while the leader is still held down might not update snapshot
+pub fn cycle_application(target: appmodel.AppTarget) bool {
+    if (cycle_target == null or !std.mem.eql(u8, cycle_target.?.display_name, target.display_name)) {
+        reset_cycle();
+        cycle_target = target;
     }
+
+    if (!cycle_active or cycle_len == 0) start_scan();
+
+    // Check staleness (window closed mid cycle)
+    if (cycle_len > 0 and !win32.IsWindow(cycle_windows[cycle_index]).toBool()) {
+        start_scan();
+    }
+
+    if (cycle_len == 0) {
+        log.warn("no window found for '{s}'", .{target.display_name});
+        return false;
+    }
+
+    const hwnd = cycle_windows[cycle_index];
+    cycle_index = (cycle_index + 1) % cycle_len;
+    focus_window(hwnd);
     return true;
 }
 
-pub fn activate_application(name: []const u16) void {
-    const l_param: win.LPARAM = @intCast(@intFromPtr(&name));
-    _ = EnumWindows(&find_and_activate_window, l_param);
+pub fn reset_cycle() void {
+    cycle_active = false;
+    cycle_len = 0;
+    cycle_index = 0;
+    cycle_target = null;
+}
+
+// Bring the window corresponding to `hwnd` to the foreground.
+fn focus_window(hwnd: win.HWND) void {
+    const cmd: c_int = if (win32.IsIconic(hwnd).toBool()) win32.SW_RESTORE else win32.SW_SHOW;
+    _ = win32.ShowWindow(hwnd, cmd);
+
+    // Temp merge window thread input queues of foreground & target
+    // If we do this in a bg thread/attach our own thread, Windows will block and flash the app icon instead
+    // Partially inspired by https://github.com/AutoHotkey/AutoHotkey/blob/alpha/source/window.cpp
+    const foreground = win32.GetForegroundWindow();
+    const foreground_thread = if (foreground) |fg| win32.GetWindowThreadProcessId(fg, null) else 0;
+    const target_thread = win32.GetWindowThreadProcessId(hwnd, null);
+
+    var attached = false;
+    if (foreground_thread != 0 and target_thread != 0 and foreground_thread != target_thread) {
+        // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-attachthreadinput#remarks
+        attached = win32.AttachThreadInput(foreground_thread, target_thread, true).toBool();
+    }
+
+    // https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setforegroundwindow#remarks
+    _ = win32.SetForegroundWindow(hwnd);
+    _ = win32.BringWindowToTop(hwnd);
+    if (attached) {
+        _ = win32.AttachThreadInput(foreground_thread, target_thread, false);
+    }
 }

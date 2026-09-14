@@ -1,166 +1,152 @@
 const std = @import("std");
-const processes = @import("processes.zig");
 const applications = @import("applications.zig");
+const appmodel = @import("appmodel.zig");
+const app_bindings = @import("bindings.zig");
+const app_config = @import("config.zig");
+const cli = @import("cli.zig");
+const watcher = @import("watcher.zig");
+const win32 = @import("win32.zig");
 const win = std.os.windows;
 
-const HHOOK = *opaque {};
-const HOOKPROC = *const fn (nCode: c_int, wParam: win.WPARAM, lParam: win.LPARAM) callconv(.winapi) win.LRESULT;
-const KBDLLHOOKSTRUCT = extern struct {
-    vkCode: u32,
-    scanCode: u32,
-    flags: u32,
-    time: u32,
-    dwExtraInfo: u32,
-};
-const MSLLHOOKSTRUCT = extern struct {
-    pt: win.POINT,
-    mouseData: win.DWORD,
-    flags: win.DWORD,
-    time: win.DWORD,
-    dwExtraInfo: win.ULONG_PTR,
-};
-const MSG = extern struct {
-    hwnd: win.HWND,
-    message: u32,
-    wParam: win.WPARAM,
-    lParam: win.LPARAM,
-    time: win.DWORD,
-    pt: win.POINT,
-    lPrivate: win.DWORD,
-};
+var bindings: []const app_bindings.Binding = &.{};
 
-extern "user32" fn SetWindowsHookExW(idHook: c_int, lpfn: HOOKPROC, hMod: ?win.HINSTANCE, dwThreadId: win.DWORD) callconv(.winapi) ?HHOOK;
-extern "user32" fn CallNextHookEx(hhk: ?HHOOK, nCode: c_int, wParam: win.WPARAM, lParam: win.LPARAM) callconv(.winapi) win.LRESULT;
-extern "user32" fn UnhookWindowsHookEx(hhk: ?HHOOK) callconv(.winapi) bool;
-extern "user32" fn GetMessageW(lpMsg: *MSG, hwnd: ?win.HWND, wMsgFilterMin: u32, wMsgFilterMax: u32) callconv(.winapi) bool;
+// Set while an X1/X2 leader is held. We consume those events, so we track the
+// state from the down/up pair instead of polling the async key state.
+var mouse_leader_down = false;
 
-const WH_KEYBOARD_LL = 13;
-const WH_MOUSE_LL = 14;
-const WM_KEYDOWN = 0x0100;
-const WM_SYSKEYDOWN = 0x0104;
-const WM_SYSKEYUP = 0x0105;
-const VK_RMENU = 0xA5;
-const WM_XBUTTONDOWN = 0x020B;
-const WM_XBUTTONUP = 0x020C;
+// Holds the current config text and bindings. Swapped on reload.
+var config_arena: ?*std.heap.ArenaAllocator = null;
 
-const ActionHookHandler = struct {
-    allocator: std.mem.Allocator,
-    seq_action: std.StringHashMap([]const u8),
-    mod_held: bool,
+// Whether a leader (RightAlt, or a held X1/X2) is currently down.
+fn activated() bool {
+    return mouse_leader_down or win32.GetAsyncKeyState(win32.VK_RMENU) < 0;
+}
 
-    const Self = @This();
+// Returns true if the event was consumed and must not reach the app.
+fn handle_key_down(kb: *const win32.KBDLLHOOKSTRUCT) bool {
+    if (!activated()) return false;
+    return dispatch(kb.vkCode);
+}
 
-    pub fn init(allocator: std.mem.Allocator) Self {
-        return ActionHookHandler{
-            .allocator = allocator,
-            .seq_action = std.StringHashMap([]const u8).init(allocator),
-            .mod_held = false,
-        };
+fn handle_sys_key_down(kb: *const win32.KBDLLHOOKSTRUCT) bool {
+    if (kb.vkCode == win32.VK_RMENU) {
+        applications.reset_cycle();
+        return false;
     }
+    if (!activated()) return false;
+    return dispatch(kb.vkCode);
+}
 
-    pub fn deinit(self: *Self) void {
-        self.seq_action.deinit();
-    }
+// Handle mouse-based activation. Always swallow so shit like back/forward nav in browsers won't trigger.
+fn handle_mouse_down(_: *const win32.MSLLHOOKSTRUCT) bool {
+    mouse_leader_down = true;
+    applications.reset_cycle();
+    return true;
+}
 
-    pub fn keydown(self: *Self, kb: *const KBDLLHOOKSTRUCT) void {
-        std.debug.print("keydown: {}\n", .{kb});
-        std.debug.print("mod_held: {}\n", .{self.mod_held});
-        // _ = self;
-        // _ = kb;
-        if (!self.mod_held) {
-            return;
-        }
+fn handle_mouse_up(_: *const win32.MSLLHOOKSTRUCT) bool {
+    mouse_leader_down = false;
+    return true;
+}
 
-        const name = "edge";
-        const cast = @as([*]const u16, @ptrCast(@alignCast(name)))[0..2];
-        applications.activate_application(cast);
-    }
-
-    pub fn syskeydown(self: *Self, kb: *const KBDLLHOOKSTRUCT) void {
-        std.debug.print("syskeydown: {}\n", .{kb});
-        if (kb.vkCode == VK_RMENU) {
-            self.mod_held = true;
+// Nust run in same thread as input handler. Returns if input should be swallowed.
+fn dispatch(vk_code: u32) bool {
+    if (vk_code > 0x7f) return false;
+    const key = std.ascii.toLower(@intCast(vk_code));
+    for (bindings) |binding| {
+        if (binding.key == key) {
+            _ = applications.cycle_application(binding.target);
+            return true;
         }
     }
-
-    pub fn syskeyup(self: *Self, kb: *const KBDLLHOOKSTRUCT) void {
-        std.debug.print("syskeyup: {}\n", .{kb});
-        self.mod_held = false;
-    }
-
-    pub fn mousedown(self: *Self, ms: *const MSLLHOOKSTRUCT) void {
-        const btn = ms.mouseData >> 16;
-        std.debug.print("mousebtn: {}\n", .{btn});
-        self.mod_held = true;
-    }
-
-    pub fn mouseup(self: *Self, ms: *const MSLLHOOKSTRUCT) void {
-        const btn = ms.mouseData >> 16;
-        std.debug.print("mouseup: {}\n", .{btn});
-        self.mod_held = false;
-    }
-};
-
-var handler_g: ?*ActionHookHandler = null;
+    return false;
+}
 
 // LowLevelKeyboardProc
-fn key_hookproc(n_code: c_int, w_param: win.WPARAM, l_param: win.LPARAM) callconv(.winapi) win.LRESULT {
+fn key_hookproc(n_code: c_int, w_param: win32.WPARAM, l_param: win.LPARAM) callconv(.winapi) win32.LRESULT {
     if (n_code >= 0) {
-        const kb = @as(*KBDLLHOOKSTRUCT, @ptrFromInt(@as(usize, @intCast(l_param))));
-        switch (w_param) {
-            WM_KEYDOWN => handler_g.?.keydown(kb),
-            WM_SYSKEYDOWN => handler_g.?.syskeydown(kb),
-            WM_SYSKEYUP => handler_g.?.syskeyup(kb),
-            else => {},
+        const kb = @as(*win32.KBDLLHOOKSTRUCT, @ptrFromInt(@as(usize, @intCast(l_param))));
+        if ((kb.flags & win32.LLKHF_INJECTED) == 0) {
+            const consumed = switch (w_param) {
+                win32.WM_KEYDOWN => handle_key_down(kb),
+                win32.WM_SYSKEYDOWN => handle_sys_key_down(kb),
+                else => false,
+            };
+            if (consumed) return 1;
         }
     }
-    return CallNextHookEx(null, n_code, w_param, l_param);
+    return win32.CallNextHookEx(null, n_code, w_param, l_param);
 }
 
 // LowLevelMouseProc
-fn mouse_hookproc(n_code: c_int, w_param: win.WPARAM, l_param: win.LPARAM) callconv(.winapi) win.LRESULT {
+fn mouse_hookproc(n_code: c_int, w_param: win32.WPARAM, l_param: win.LPARAM) callconv(.winapi) win32.LRESULT {
     if (n_code >= 0) {
-        const ms = @as(*MSLLHOOKSTRUCT, @ptrFromInt(@as(usize, @intCast(l_param))));
-        switch (w_param) {
-            WM_XBUTTONDOWN => handler_g.?.mousedown(ms),
-            WM_XBUTTONUP => handler_g.?.mouseup(ms),
-            else => {},
+        const ms = @as(*win32.MSLLHOOKSTRUCT, @ptrFromInt(@as(usize, @intCast(l_param))));
+        if ((ms.flags & win32.LLMHF_INJECTED) == 0) {
+            const consumed = switch (w_param) {
+                win32.WM_XBUTTONDOWN => handle_mouse_down(ms),
+                win32.WM_XBUTTONUP => handle_mouse_up(ms),
+                else => false,
+            };
+            if (consumed) return 1;
         }
     }
-    return CallNextHookEx(null, n_code, w_param, l_param);
+    return win32.CallNextHookEx(null, n_code, w_param, l_param);
 }
 
-pub fn main() !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
+// (Re)build `bindings` from the config file into a fresh arena. The old arena
+// is freed only after the new bindings exist, so a hook can never observe
+// freed bindings. Returns the config path (for watching).
+fn apply_config(io: std.Io, backing: std.mem.Allocator) ![]const u8 {
+    const arena = try backing.create(std.heap.ArenaAllocator);
+    arena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    errdefer {
+        arena.deinit();
+        backing.destroy(arena);
+    }
 
-    const allocator = arena.allocator();
+    const loaded = try app_config.load(io, arena.allocator());
+    const new_bindings = try app_bindings.build(arena.allocator(), loaded.config);
 
-    // var process_names = try processes.list_process_names(allocator);
-    // defer process_names.deinit(allocator);
+    // Swap in the new bindings and drop every reference into the old arena
+    // (the cached cycle target points at a `display_name` inside it) before
+    // freeing it.
+    const old_arena = config_arena;
+    config_arena = arena;
+    bindings = new_bindings;
+    applications.reset_cycle();
 
-    // var process_names = try applications.list_applications(allocator);
-    // defer process_names.deinit(allocator);
+    if (old_arena) |old| {
+        old.deinit();
+        backing.destroy(old);
+    }
+    return loaded.path;
+}
 
-    // for (process_names.items) |name| {
-    //     const utf8string = try std.unicode.utf16LeToUtf8Alloc(allocator, name);
-    //     std.debug.print("App: {s}\n", .{utf8string});
-    // }
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.arena.allocator();
 
-    var handler = ActionHookHandler.init(allocator);
-    defer handler.deinit();
+    const args = try std.process.Args.toSlice(init.minimal.args, allocator);
+    if (args.len > 1) return cli.run(init.io, allocator, args);
 
-    // handler.seq_action.put("a", "..");
-    handler_g = &handler;
+    appmodel.init();
+    defer appmodel.deinit();
 
-    const kb_hook = SetWindowsHookExW(WH_KEYBOARD_LL, key_hookproc, null, 0);
+    const config_path = try apply_config(init.io, allocator);
+    std.debug.print("rswap: loaded {} binding(s)\n", .{bindings.len});
+
+    if (watcher.Watcher.start(allocator, config_path, win32.GetCurrentThreadId())) |_| {} else |err| {
+        std.debug.print("config watch unavailable: {t}\n", .{err});
+    }
+
+    const kb_hook = win32.SetWindowsHookExW(win32.WH_KEYBOARD_LL, key_hookproc, null, 0);
     if (kb_hook == null) {
         std.debug.print("Failed to install keyboard hook\n", .{});
         return;
     }
-    defer _ = UnhookWindowsHookEx(kb_hook);
+    defer _ = win32.UnhookWindowsHookEx(kb_hook);
 
-    const ms_hook = SetWindowsHookExW(WH_MOUSE_LL, mouse_hookproc, null, 0);
+    const ms_hook = win32.SetWindowsHookExW(win32.WH_MOUSE_LL, mouse_hookproc, null, 0);
     if (ms_hook == null) {
         std.debug.print("Failed to install mouse hook\n", .{});
         return;
@@ -168,6 +154,14 @@ pub fn main() !void {
 
     std.debug.print("Hooks mounted, waiting for sigterm\n", .{});
 
-    var msg: MSG = undefined;
-    while (GetMessageW(&msg, null, 0, 0)) {}
+    var msg: win32.MSG = undefined;
+    while (win32.GetMessageW(&msg, null, 0, 0)) {
+        if (msg.message == watcher.WM_RELOAD) {
+            _ = apply_config(init.io, allocator) catch |err| {
+                std.debug.print("config reload failed: {t}\n", .{err});
+                continue;
+            };
+            std.debug.print("rswap: loaded {} binding(s)\n", .{bindings.len});
+        }
+    }
 }

@@ -83,8 +83,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // link psapi library
-    exe.linkSystemLibrary("psapi");
+    exe.root_module.linkSystemLibrary("shell32", .{ .use_pkg_config = .no });
+    exe.root_module.linkSystemLibrary("ole32", .{ .use_pkg_config = .no });
+    exe.root_module.linkSystemLibrary("version", .{ .use_pkg_config = .no });
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
